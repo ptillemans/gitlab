@@ -1,6 +1,6 @@
-# gitlab
+# gitlab dashboard
 
-A [re-frame](https://github.com/Day8/re-frame) application designed to ... well, that part is up to you.
+A [re-frame](https://github.com/Day8/re-frame) application designed to gain insights in the performance of the gitlab application.
 
 ## Development Mode
 

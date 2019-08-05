@@ -11,6 +11,8 @@
                  [yogthos/config "1.1.2"]
                  [ring "1.7.1"]
                  [clj-ssh "0.5.14"]
+                 [clj-http "3.10.0"]
+                 [cheshire "5.8.1"]
                  [instaparse "1.4.10"]]
 
   :plugins [[lein-cljsbuild "1.1.7"]

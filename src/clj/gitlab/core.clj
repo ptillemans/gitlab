@@ -23,6 +23,7 @@
 (defn with-command-runner
   "Creates a  context to chain multiple remote commands in a session."
   [config f]
+  {:pre [(s/valid ::config config)]}
   (let [s (ssh/jump-session
            (ssh/ssh-agent {})
            (vec (map #(do {:hostname %}) (::host-chain config)))

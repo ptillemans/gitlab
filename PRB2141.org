@@ -1,0 +1,240 @@
+#+TITLE: Problem 2141 : Performance of GitLab
+
+
+* Introduction
+
+* Architecture and Influence Diagram
+
+#+begin_src dot :file resources/public/images/webgui.png :results output :exports none
+  digraph G {
+    user [label="User",shape=none];
+    git;
+    browser;
+
+    runner [shape="octagon"];
+
+    gitshell [label="GitLab Shell"];
+    unicorn [label="Unicorn (Rails)"];
+    repos [label="Git Repositories", shape="cylinder"];
+    assets [label="Static Assets", shape="cylinder"];
+    artifacts [label="Job Artifacts", shape="cylinder"];
+
+    subgraph top {
+      rank="same";
+      user;
+      runner;
+    }
+
+    subgraph cluster_tools {
+      label = "Development PC";
+      rank = "same";
+      browser;
+      git;
+    }
+
+    subgraph cluster_storage {
+      label = "NFS storage";
+      rank = "same";
+      assets;
+      artifacts;
+      repos;
+    }
+
+    subgraph cluster_gitlab {
+      label="GitLab Omnibus"
+      rank = "same";
+      nginx;
+      workhorse;
+      gitshell;
+      gitaly;
+      unicorn;
+      pre_receive;
+      subgraph dbs {
+        rank = "same";
+        postgres;
+        redis;
+      }
+
+
+  }
+
+
+  # User uses UI
+  user -> browser;
+  browser -> nginx -> workhorse;
+  workhorse -> unicorn [label="ui+auth", color="red"];
+  workhorse -> assets [label="get"];
+  workhorse -> GitLFS [label="upload"];
+  workhorse -> gitaly [label="clone"];
+  workhorse -> redis;
+  unicorn -> postgres;
+  unicorn -> redis;
+  unicorn -> gitaly;
+
+  # user fetches changes
+  user -> git;
+  git -> gitshell [label="pull"];
+  gitshell -> unicorn [label="auth", color="red"];
+  gitshell -> gitaly [label="fetch"];
+
+  # user pushes changes
+  git -> gitshell[label="push"];
+  gitshell -> gitaly -> pre_receive [label="push"];
+  pre_receive -> unicorn[label="auth",color="red"];
+
+  # job fetches artifacts
+  edge [color="blue"];
+  runner -> nginx -> workhorse -> unicorn [label="fetch artifacts"]
+  unicorn -> workhorse -> artifacts [label="send artifacts"];
+  runner -> gitshell -> gitaly -> repos -> runner [label="job fetch"];
+  gitaly -> unicorn [label="job auth"];
+
+  # Gitaly manages git repo access
+  gitaly -> repos;
+
+
+  }
+
+#+end_src
+
+#+RESULTS:
+[[file:resources/public/images/webgui.png]]
+
+** Major Components
+
+*** GitLab Shell
+
+[[https://gitlab.com/gitlab-org/gitlab-shell][GitLanb Shell github page]]
+
+GitLab Shell handles git SSH sessions for GitLab and modifies the list of authorized keys.
+GitLab Shell is not a Unix shell nor a replacement for Bash or Zsh.
+When you access the GitLab server over SSH then GitLab Shell will:
+
+Limits you to predefined git commands (git push, git pull).
+Call the GitLab Rails API to check if you are authorized, and what Gitaly server your repository is on
+Copy data back and forth between the SSH client and the Gitaly server
+
+If you access a GitLab server over HTTP(S) you end up in gitlab-workhorse.
+
+An overview of the use cases described above:
+
+1. git pull over SSH -> gitlab-shell -> API call to gitlab-rails (Authorization) ->
+accept or decline -> establish Gitaly
+
+2. session git push over SSH -> gitlab-shell (git command is not executed yet)
+   -> establish Gitaly session -> (in Gitaly) gitlab-shell pre-receive hook ->
+   API call to gitlab-rails (authorization) -> accept or decline push
+
+*** GitLab Workhorse
+
+Gitlab-workhorse is a smart reverse proxy for GitLab. It handles
+"large" HTTP requests such as file downloads, file uploads, Git
+push/pull and Git archive downloads.
+
+Workhorse can:
+
+ - handle some requests without involving Rails at all: for example, Javascript
+   files and CSS files are served straight from disk.
+ - Workhorse can modify responses sent by Rails: for example if you use
+   *send_file* in Rails then gitlab-workhorse will open the file on disk and send
+   its contents as the response body to the client.
+ - Workhorse can take over requests after asking permission from Rails. example:
+   handling git clone.
+ - Workhorse can modify requests before passing them to Rails. Example: when
+   handling a Git LFS upload Workhorse first asks permission from Rails, then it
+   stores the request body in a tempfile, then it sends a modified request
+   containing the tempfile path to Rails.
+ - Workhorse can manage long-lived WebSocket connections for Rails. Example:
+   handling the terminal websocket for environments.
+
+Workhorse does not:
+
+ - connect to Postgres, only to Rails and (optionally) Redis.
+ - accept HTTPS connections.
+ - clean up idle client connections.
+
+All requests to Rails pass through Workhorse.
+
+*** Gitaly
+
+Gitaly is a Git RPC
+
+service for handling all the git calls made by GitLab.
+To see where it fits in please look at GitLab's architecture.
+
+Fault-tolerant horizontal scaling of Git storage in GitLab, and particularly, on gitlab.com.
+This will be achieved by focusing on two areas (in this order):
+
+Migrate from repository access via NFS to gitaly-proto, GitLab's new Git RPC protocol
+Evolve from large Gitaly servers managed as "pets" to smaller Gitaly servers that are "cattle"
+
+*** Sidekiq
+
+Background workers for the Rails app.
+
+Handles with delayed execution of tasks requested through the frontend or
+regular maintenance.
+
+see [[https://gitlab.com/gitlab-org/gitlab-foss/blob/master/config/sidekiq_queues.yml][sidekiq_queues.yml for the queuenames]] to see what kind of jobs these are.
+
+* Theories and/or Possible Root Causes
+
+** Project 82100 is misconfigured and creates unreasonable load.
+
+Whether or not the build scripts are well designed or not, needs to be further
+investigated. Certainly improvements can bve made there, there is always room
+for improvement.
+
+The fact of the matter is that due to compliance rules for *Functional Safety*
+we need very stringent quality controls in order to play in the automotive
+market. It is unlikely that redesigning the build pipeline will result in
+considerable load savings in the short term and it is highly likely that more
+rather than less scrutiny will be needed with additional checks so even if we
+could gain some short term relieve it is unlikely this will solve the problem in
+the medium and long term.
+
+In any case infrastructure like this should not break and become unusable, but
+should be degrading gracefully and not accepting or throttling work when it is
+running at its point of maximum throughput.
+
+It should not be possible for the system to be pushed over by actions of
+end-users. End users  should feel confident that whatever they throw at the
+system, the system will reject the work immediately in the case of synchronous/interactive
+services or deliver it eventually in the case of asynchronous services with long
+acceptable response time in the service level.
+
+** Sidekiq workers steal all CPU resources
+
+Very early in the investigation there were the observations pointing that after
+the launch of build of project 82100 all sidekiq workers were consuming all CPU
+and starving the other processes including the web server causing it to slow down.
+
+While this was contradicted by the VMware monitoring, it was easy and rather
+cheap to remedy by increasing the number of CPU's to a higher number that the 25
+configured background workers.
+
+The day after the change we found no significant improvement and improved data
+at that time confirmed that the sidekiq processes were indeed not consuming all
+CPU.
+
+
+
+* Issues
+
+These issues were found but are not immediately related to the root cause of
+this problem. They could be other bugs, misconfigurations, impediments to
+collect information, or otherwise cause delays and/or frustration.
+
+** Access Logs contain no response time information
+
+** GitLab admin access is not possible via OpenVPN
+
+** No access to logfiles
+
+** No permissions to run docker commands
+
+** docker-compose file is not part of the solution git repository
+
+* Actions
+
+**
